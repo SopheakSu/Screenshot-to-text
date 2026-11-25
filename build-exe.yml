@@ -1,0 +1,22 @@
+name: Build ScreenToExcel.exe
+on: [push, workflow_dispatch]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install -r requirements.txt
+      - run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name ScreenToExcel
+          --collect-all winrt
+          --hidden-import winrt.windows.media.ocr --hidden-import winrt.windows.globalization
+          --hidden-import winrt.windows.graphics.imaging --hidden-import winrt.windows.storage.streams
+          --hidden-import winrt.windows.foundation --hidden-import winrt.windows.foundation.collections
+          ScreenToExcel.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ScreenToExcel-exe
+          path: dist/ScreenToExcel.exe
