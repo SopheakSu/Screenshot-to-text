@@ -43,6 +43,57 @@ def trim_edge_strips(img: Image.Image) -> Image.Image:
     return img
 
 
+def _solid_bgs(a, keys2d, min_frac=0.03):
+    """Colours (mean RGB) in this region that form solid areas = backgrounds."""
+    h, w = keys2d.shape
+    flat = keys2d.ravel()
+    counts = np.bincount(flat, minlength=512)
+    order = np.argsort(counts)[::-1]
+    r = 2 if min(h, w) > 10 else 1
+    bgs = []
+    for k in order[:8]:
+        if counts[k] / flat.size < min_frac:
+            break
+        m = keys2d == k
+        solid = m.copy()
+        if h > 2 * r and w > 2 * r:
+            core = np.ones_like(m)
+            for dy in range(-r, r + 1):
+                for dx in range(-r, r + 1):
+                    sh = np.zeros_like(m)
+                    ys, yd = (slice(dy, None), slice(None, -dy or None)) if dy >= 0 else (slice(None, dy), slice(-dy, None))
+                    xs, xd = (slice(dx, None), slice(None, -dx or None)) if dx >= 0 else (slice(None, dx), slice(-dx, None))
+                    sh[yd, xd] = m[ys, xs]
+                    core &= sh
+            solid = core
+        if solid.sum() / max(m.sum(), 1) > 0.25 or not bgs and k == order[0]:
+            bgs.append(a.reshape(-1, 3)[flat == k].mean(axis=0))
+    return bgs or [a.reshape(-1, 3).mean(axis=0)]
+
+
+def _ink_rows(a):
+    """Background found separately for each horizontal band (table row), so a
+    colour can be background in one row and text in another."""
+    h, w, _ = a.shape
+    q = a // 32
+    keys = q[:, :, 0] * 64 + q[:, :, 1] * 8 + q[:, :, 2]
+    row_mode = np.array([np.bincount(keys[y]).argmax() for y in range(h)])
+    ink = np.zeros((h, w))
+    y = 0
+    while y < h:
+        y2 = y
+        while y2 < h and row_mode[y2] == row_mode[y]:
+            y2 += 1
+        band = a[y:y2]
+        bgs = _solid_bgs(band, keys[y:y2])
+        flat = band.reshape(-1, 1, 3)
+        bg = np.array(bgs).reshape(1, -1, 3)
+        d = np.sqrt(((flat - bg) ** 2).sum(axis=2)).min(axis=1)
+        ink[y:y2] = d.reshape(y2 - y, w)
+        y = y2
+    return ink
+
+
 def preprocess(img: Image.Image, scale: int = SCALE, mode: str = "solid") -> Image.Image:
     """Return a clean black-on-white image, upscaled.
     mode: "solid" (backgrounds = large solid colour areas), "frequent"
@@ -81,9 +132,12 @@ def preprocess(img: Image.Image, scale: int = SCALE, mode: str = "solid") -> Ima
         bgs = [a.reshape(-1, 3)[keys == order[0]].mean(axis=0)]
 
     # 2. Text-ness = distance from the nearest background colour.
-    flat = a.reshape(-1, 1, 3)
-    bg = np.array(bgs).reshape(1, -1, 3)
-    dist = np.sqrt(((flat - bg) ** 2).sum(axis=2)).min(axis=1).reshape(h, w)
+    if mode == "rows":
+        dist = _ink_rows(a)
+    else:
+        flat = a.reshape(-1, 1, 3)
+        bg = np.array(bgs).reshape(1, -1, 3)
+        dist = np.sqrt(((flat - bg) ** 2).sum(axis=2)).min(axis=1).reshape(h, w)
     ink = np.clip(dist * 2.2, 0, 255)  # 0 = background, 255 = text
 
     # 3. Remove grid lines: only long *unbroken* straight runs are lines.
@@ -258,7 +312,7 @@ def run_ocr(img: Image.Image, engine: str = "auto"):
     for eng in order:
         fn = _ocr_windows if eng == "windows" else _ocr_tesseract
         best, best_score = None, -1
-        for mode in ("frequent", "solid", "main"):
+        for mode in ("rows", "frequent", "solid", "main"):
             try:
                 words = fn(preprocess(img, mode=mode))
             except Exception as e:
@@ -271,7 +325,10 @@ def run_ocr(img: Image.Image, engine: str = "auto"):
             for wd in best:  # back to original-image coordinates
                 wd.x = (wd.x - PAD) / SCALE; wd.y = (wd.y - PAD) / SCALE
                 wd.w /= SCALE; wd.h /= SCALE
-            return best, eng
+            note = eng
+            if errors:  # an earlier engine failed: say why (shown in the status bar)
+                note += "  |  " + errors[0].replace("\n", " ")[:160]
+            return best, note
         if best is not None:
             errors.append(f"{eng}: no text found")
     raise RuntimeError("No text found / OCR failed:\n" + "\n".join(errors))
