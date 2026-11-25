@@ -8,12 +8,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install Tesseract OCR
+        run: |
+          choco install tesseract -y --no-progress
+          if (!(Test-Path "C:\Program Files\Tesseract-OCR\tesseract.exe")) { throw "Tesseract install failed" }
       - name: Build exe
         run: |
           $f = Get-ChildItem -Recurse -Filter ScreenToExcel.py | Select-Object -First 1
           cd $f.DirectoryName
-          python -m pip install -r requirements.txt
-          python -m PyInstaller --noconfirm --clean --onefile --windowed --name ScreenToExcel --collect-all winrt --hidden-import winrt.windows.media.ocr --hidden-import winrt.windows.globalization --hidden-import winrt.windows.graphics.imaging --hidden-import winrt.windows.storage.streams --hidden-import winrt.windows.foundation --hidden-import winrt.windows.foundation.collections ScreenToExcel.py
+          python -m pip install pillow numpy pyinstaller winrt-runtime winrt-Windows.Foundation winrt-Windows.Foundation.Collections winrt-Windows.Globalization winrt-Windows.Graphics.Imaging winrt-Windows.Media.Ocr winrt-Windows.Storage.Streams
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name ScreenToExcel --add-data "C:\Program Files\Tesseract-OCR;tesseract" --collect-all winrt --hidden-import winrt.windows.media.ocr --hidden-import winrt.windows.globalization --hidden-import winrt.windows.graphics.imaging --hidden-import winrt.windows.storage.streams --hidden-import winrt.windows.foundation --hidden-import winrt.windows.foundation.collections ScreenToExcel.py
           New-Item -ItemType Directory -Force "$env:GITHUB_WORKSPACE\out" | Out-Null
           Copy-Item dist\ScreenToExcel.exe "$env:GITHUB_WORKSPACE\out\"
       - uses: actions/upload-artifact@v4
