@@ -21,9 +21,31 @@ PAD = 20   # white border added around the image (in upscaled pixels)
 # --------------------------------------------------------------------------
 # Image preprocessing
 # --------------------------------------------------------------------------
+def trim_edge_strips(img: Image.Image) -> Image.Image:
+    """Cut off thin strips at the left/right edge whose background colour differs
+    from the main area (a sliver of the neighbouring column caught in the crop)."""
+    a = np.asarray(img.convert("RGB")).astype(np.int32) // 48
+    key = a[:, :, 0] * 36 + a[:, :, 1] * 6 + a[:, :, 2]
+    col_mode = np.array([np.bincount(key[:, x]).argmax() for x in range(key.shape[1])])
+    main = np.bincount(col_mode).argmax()
+    w = len(col_mode)
+    limit = max(4, int(w * 0.08))
+    left = 0
+    while left < w and col_mode[left] != main:
+        left += 1
+    right = w
+    while right > 0 and col_mode[right - 1] != main:
+        right -= 1
+    left = left if left <= limit else 0
+    right = right if w - right <= limit else w
+    if right - left > w * 0.5 and (left or right < w):
+        return img.crop((left, 0, right, img.height))
+    return img
+
+
 def preprocess(img: Image.Image, scale: int = SCALE) -> Image.Image:
     """Return a clean black-on-white image, upscaled."""
-    img = img.convert("RGB")
+    img = trim_edge_strips(img.convert("RGB"))
     a = np.asarray(img).astype(np.int16)
     h, w, _ = a.shape
 
@@ -197,27 +219,12 @@ def run_ocr(img: Image.Image, engine: str = "auto"):
 
 
 # --------------------------------------------------------------------------
-# Row grouping and field extraction
+# Rows / cells -> text exactly as in the picture
 # --------------------------------------------------------------------------
-FIELDS = ["Time", "Code", "Name", "Contact", "Area", "Zone", "Type"]
-
-_CODE = re.compile(r"[0OC][1Il]\s?[-—–~]\s?((?:[0-9OoIlSBGDQC]\s?){5}[0-9OoIlSBGDQC])")
-_SEP = r"\s?[-~—–=_]+\s?"
-_TCODE = re.compile(r"T[0O][1Il]" + _SEP + r"[0O]*([0-9Il])" + _SEP + r"[0-9Il]?")
-_TIME = re.compile(r"(\d{1,2})\s?/\s?(\d{1,2})\s+(\d{2})\s?[:.]?\s?(\d{2})")
-_DIGIT_FIX = str.maketrans({"O": "0", "o": "0", "I": "1", "l": "1", "S": "5", "B": "8", "G": "0", "D": "0", "Q": "0", "C": "0"})
-
-
-@dataclass
-class Row:
-    words: list
-    fields: dict = field(default_factory=dict)
-    raw: str = ""
-
-
 def group_rows(words):
+    """Group words into lines by vertical position. Returns (rows, median_height)."""
     if not words:
-        return []
+        return [], 10
     hs = [w.h for w in words if w.h > 0]
     med_h = statistics.median(hs) if hs else 10
     words = sorted(words, key=lambda w: w.cy)
@@ -233,71 +240,36 @@ def group_rows(words):
     return [sorted(r, key=lambda w: w.x) for r in rows], med_h
 
 
-def _row_text(ws, med_h):
-    """Join words; insert ' | ' where there is a big horizontal gap (new cell)."""
-    parts = []
-    for i, w in enumerate(ws):
-        if i:
-            gap = w.x - ws[i - 1].right
-            parts.append(" | " if gap > med_h * 0.9 else " ")
-        parts.append(w.text)
-    return "".join(parts)
+def _fix(text):
+    """Small, safe fixes for typical OCR mistakes on screen fonts."""
+    t = text.replace("€", "E").replace("—", "-").replace("–", "-").replace("~", "-")
+    t = re.sub(r"!(?=\d)", "", t)                 # "SH!1" -> "SH1"
+    t = re.sub(r"(?<=[A-Za-z0-9])!", "1", t)      # "Beam!-3" -> "Beam1-3"
+    t = re.sub(r"(?<=[A-Z])[|](?=[-,\s]|$)", "1", t)
+    t = re.sub(r"\b([A-Z]{1,3}) (\d+-)", r"\1\2", t)   # "DP 1-3" -> "DP1-3"
+    t = re.sub(r"\b(SH|DP|M)[Il](?=[-,\s]|$)", r"\g<1>1", t)  # "SHI" -> "SH1"
+    return t.strip(" _|.'`\"")
 
 
-def _clean(s):
-    s = s.replace("|", " ")
-    s = re.sub(r"\s+", " ", s)
-    return s.strip(" -_.,~—–'\"`")
-
-
-def parse_row_text(text, type_text="Intruder"):
-    f = {k: "" for k in FIELDS}
-    f["Type"] = type_text
-    m_code = _CODE.search(text)
-    if not m_code:
-        return None
-    f["Code"] = "01-" + m_code.group(1).replace(" ", "").translate(_DIGIT_FIX)
-
-    m_time = _TIME.search(text[:m_code.start()].translate(_DIGIT_FIX))
-    if m_time:
-        mo, d, hh, mm = m_time.groups()
-        f["Time"] = f"{int(mo):02d}/{int(d):02d} {int(hh):02d}:{mm}"
-
-    rest = text[m_code.end():]
-    # drop the "-____" tail of the code (sometimes clipped as "-00C")
-    rest = re.sub(r"^\s?[-—–~]+[_0OoCc.\-—–]{0,4}", "", rest)
-
-    m_t = _TCODE.search(rest)
-    if m_t:
-        f["Name"] = _clean(rest[:m_t.start()])
-        f["Area"] = m_t.group(1).translate(_DIGIT_FIX)
-        after = rest[m_t.end():]
-        # zone = text up to the next cell boundary / dash column / lone number
-        zone = re.split(r"\s\|\s|\s[-–—~_]+(?:\s|$)|\s\d+(?:\s|$)", after, maxsplit=1)[0]
-        zone = re.sub(r"[~—–]", "-", zone)
-        zone = re.sub(r"^(\d) ([A-Z])", r"\1\2", zone)  # "1 F-Show" -> "1F-Show"
-        zone = re.sub(r"([A-Z]) (\d)", r"\1\2", zone)                    # "DP 1-3" -> "DP1-3"
-        zone = re.sub(r"(SH|DP|M|F)[IiltT|](?=[-,\s]|$)", r"\g<1>1", zone)  # "SHI" -> "SH1"
-        f["Zone"] = _clean(zone).rstrip("/\\|")
-    else:
-        f["Name"] = _clean(rest.split(" | ")[0])
-    return f
-
-
-def parse_rows(words, type_text="Intruder"):
-    grouped = group_rows(words)
-    if not grouped:
-        return []
-    rows, med_h = grouped
+def image_to_table(img, engine="auto", split_cells=True):
+    """Returns (rows, engine_used). rows = list of rows, each a list of cell strings.
+    Cells are split where there is a wide horizontal gap (a new column)."""
+    words, used = run_ocr(img, engine)
+    rows, med_h = group_rows(words)
     out = []
     for ws in rows:
-        text = _row_text(ws, med_h)
-        f = parse_row_text(text, type_text)
-        if f:
-            out.append(Row(ws, f, text))
-    return out
-
-
-def image_to_rows(img, engine="auto", type_text="Intruder"):
-    words, used = run_ocr(img, engine)
-    return parse_rows(words, type_text), used
+        cells, cur = [], [ws[0].text]
+        for prev, w in zip(ws, ws[1:]):
+            gap = w.x - prev.right
+            if split_cells and gap > med_h * 1.6:
+                cells.append(" ".join(cur))
+                cur = [w.text]
+            else:
+                cur.append(w.text)
+        cells.append(" ".join(cur))
+        cells = [_fix(c) for c in cells]
+        cells = [c for c in cells if re.search(r"[A-Za-z0-9].*[A-Za-z0-9]|[A-Za-z0-9]{1}", c)]
+        # drop lines that are only noise (e.g. bits of grid lines)
+        if cells and sum(len(re.sub(r"[^A-Za-z0-9]", "", c)) for c in cells) >= 2:
+            out.append(cells)
+    return out, used
