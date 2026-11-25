@@ -47,7 +47,7 @@ class App:
         ttk.Checkbutton(opt, text="Copy automatically", variable=self.autocopy).pack(side="left")
         ttk.Checkbutton(opt, text="Split columns into Excel cells", variable=self.split).pack(side="left", padx=10)
         ttk.Label(opt, text="OCR:").pack(side="left")
-        ttk.Combobox(opt, textvariable=self.engine, values=["auto", "windows", "tesseract"],
+        ttk.Combobox(opt, textvariable=self.engine, values=["auto", "tesseract", "windows"],
                      width=9, state="readonly").pack(side="left", padx=4)
 
         panes = ttk.PanedWindow(root, orient="horizontal")
@@ -121,7 +121,8 @@ class App:
             try:
                 self.q.put(("ok", ocr_core.image_to_table(img, engine, split)))
             except Exception as e:
-                self.q.put(("err", str(e)))
+                import traceback
+                self.q.put(("err", f"{e}\n\n{traceback.format_exc()}"))
         threading.Thread(target=work, daemon=True).start()
 
     def poll(self):
@@ -131,8 +132,9 @@ class App:
                 self.busy = False
                 self.root.config(cursor="")
                 if kind == "err":
-                    self.status.set("OCR failed.")
-                    messagebox.showerror(APP, data)
+                    self.status.set("OCR failed - see the message in the result box.")
+                    self.text.delete("1.0", "end")
+                    self.text.insert("1.0", "ERROR (please send a screenshot of this):\n\n" + data)
                     continue
                 rows, used = data
                 self.text.delete("1.0", "end")

@@ -182,39 +182,74 @@ def _ocr_windows(img: Image.Image):
     return words
 
 
-def _ocr_tesseract(img: Image.Image):
-    import os
-    import pytesseract
-    for p in (r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+def find_tesseract():
+    """Bundled copy (inside the exe) first, then a normal installation."""
+    import os, shutil, sys
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    for p in (os.path.join(base, "tesseract", "tesseract.exe"),
+              r"C:\Program Files\Tesseract-OCR\tesseract.exe",
               r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"):
         if os.path.exists(p):
-            pytesseract.pytesseract.tesseract_cmd = p
-            break
-    d = pytesseract.image_to_data(img, lang="eng", config="--psm 6",
-                                  output_type=pytesseract.Output.DICT)
+            return p
+    return shutil.which("tesseract")
+
+
+def _ocr_tesseract(img: Image.Image):
+    import os, subprocess, sys, tempfile
+    exe = find_tesseract()
+    if not exe:
+        raise RuntimeError("Tesseract not found")
+    env = dict(os.environ)
+    tessdata = os.path.join(os.path.dirname(exe), "tessdata")
+    if os.path.isdir(tessdata):
+        env["TESSDATA_PREFIX"] = tessdata
+    fd, path = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    try:
+        img.save(path)
+        flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
+        r = subprocess.run([exe, path, "stdout", "-l", "eng", "--psm", "6", "tsv"],
+                           capture_output=True, stdin=subprocess.DEVNULL,
+                           env=env, creationflags=flags, timeout=60)
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.decode("utf-8", "replace")[-500:])
     words = []
-    for i, t in enumerate(d["text"]):
-        t = (t or "").strip()
-        if t and float(d["conf"][i]) > -1:
-            words.append(Word(t, d["left"][i], d["top"][i], d["width"][i], d["height"][i]))
+    lines = r.stdout.decode("utf-8", "replace").splitlines()
+    for line in lines[1:]:
+        p = line.split("\t")
+        if len(p) >= 12 and p[11].strip():
+            words.append(Word(p[11].strip(), float(p[6]), float(p[7]), float(p[8]), float(p[9])))
     return words
 
 
 def run_ocr(img: Image.Image, engine: str = "auto"):
-    """engine: 'auto' | 'windows' | 'tesseract'. Returns (words, engine_used)."""
+    """engine: 'auto' | 'tesseract' | 'windows'. Returns (words, engine_used).
+    auto = bundled Tesseract first; Windows OCR if Tesseract is missing/finds nothing."""
     clean = preprocess(img)
-    errors = []
-    order = {"auto": ["windows", "tesseract"], "windows": ["windows"],
+    order = {"auto": ["tesseract", "windows"], "windows": ["windows"],
              "tesseract": ["tesseract"]}[engine]
+    errors, best = [], None
     for eng in order:
         try:
             fn = _ocr_windows if eng == "windows" else _ocr_tesseract
             words = fn(clean)
-            for wd in words:  # back to original-image coordinates
-                wd.x = (wd.x - PAD) / SCALE; wd.y = (wd.y - PAD) / SCALE; wd.w /= SCALE; wd.h /= SCALE
-            return words, eng
-        except Exception as e:  # try next engine
+        except Exception as e:
             errors.append(f"{eng}: {e}")
+            continue
+        for wd in words:  # back to original-image coordinates
+            wd.x = (wd.x - PAD) / SCALE; wd.y = (wd.y - PAD) / SCALE
+            wd.w /= SCALE; wd.h /= SCALE
+        if words:
+            return words, eng
+        errors.append(f"{eng}: no text found")
+        best = best or ([], eng)
+    if best:
+        return best
     raise RuntimeError("No OCR engine worked:\n" + "\n".join(errors))
 
 
