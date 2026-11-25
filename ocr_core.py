@@ -43,26 +43,42 @@ def trim_edge_strips(img: Image.Image) -> Image.Image:
     return img
 
 
-def preprocess(img: Image.Image, scale: int = SCALE) -> Image.Image:
-    """Return a clean black-on-white image, upscaled."""
+def preprocess(img: Image.Image, scale: int = SCALE, mode: str = "solid") -> Image.Image:
+    """Return a clean black-on-white image, upscaled.
+    mode: "solid" (backgrounds = large solid colour areas), "frequent"
+    (backgrounds = colours covering >6%), "main" (only the most common colour)."""
     img = trim_edge_strips(img.convert("RGB"))
     a = np.asarray(img).astype(np.int16)
     h, w, _ = a.shape
 
-    # 1. Find background colours: the most frequent (quantised) colours.
+    # 1. Find background colours: frequent colours that form large SOLID areas.
+    #    (Text is thin: almost none of its pixels are surrounded by the same colour.)
     q = (a // 32).reshape(-1, 3)
     keys = q[:, 0] * 64 + q[:, 1] * 8 + q[:, 2]
     counts = np.bincount(keys, minlength=512)
     order = np.argsort(counts)[::-1]
     total = keys.size
+    k2d = keys.reshape(h, w)
+    r = 2 if min(h, w) > 12 else 1
     bgs = []
-    for k in order[:6]:
-        if counts[k] / total < 0.06:
+    for k in order[:8]:
+        frac = counts[k] / total
+        if mode == "main" and bgs:
             break
-        mask = keys == k
-        bgs.append(a.reshape(-1, 3)[mask].mean(axis=0))
+        if frac < (0.06 if mode == "frequent" else 0.03):
+            break
+        if mode != "solid":
+            bgs.append(a.reshape(-1, 3)[keys == k].mean(axis=0))
+            continue
+        m = k2d == k
+        solid = m.copy()
+        for dy in range(-r, r + 1):
+            for dx in range(-r, r + 1):
+                solid &= np.roll(np.roll(m, dy, axis=0), dx, axis=1)
+        if solid.sum() / max(m.sum(), 1) > 0.25:   # real background
+            bgs.append(a.reshape(-1, 3)[keys == k].mean(axis=0))
     if not bgs:
-        bgs = [np.array([0, 0, 0])]
+        bgs = [a.reshape(-1, 3)[keys == order[0]].mean(axis=0)]
 
     # 2. Text-ness = distance from the nearest background colour.
     flat = a.reshape(-1, 1, 3)
@@ -107,6 +123,7 @@ class Word:
     y: float
     w: float
     h: float
+    conf: float = 50.0
 
     @property
     def cx(self):
@@ -223,34 +240,41 @@ def _ocr_tesseract(img: Image.Image):
     for line in lines[1:]:
         p = line.split("\t")
         if len(p) >= 12 and p[11].strip():
-            words.append(Word(p[11].strip(), float(p[6]), float(p[7]), float(p[8]), float(p[9])))
+            words.append(Word(p[11].strip(), float(p[6]), float(p[7]), float(p[8]), float(p[9]), float(p[10])))
     return words
+
+
+def _score(words):
+    """How much confident text was found (longer + more confident = better)."""
+    return sum(len(re.sub(r"[^A-Za-z0-9]", "", w.text)) * max(w.conf, 0) / 100 for w in words)
 
 
 def run_ocr(img: Image.Image, engine: str = "auto"):
     """engine: 'auto' | 'tesseract' | 'windows'. Returns (words, engine_used).
-    auto = bundled Tesseract first; Windows OCR if Tesseract is missing/finds nothing."""
-    clean = preprocess(img)
+    Tries several clean-up methods and keeps the most confident result."""
     order = {"auto": ["tesseract", "windows"], "windows": ["windows"],
              "tesseract": ["tesseract"]}[engine]
-    errors, best = [], None
+    errors = []
     for eng in order:
-        try:
-            fn = _ocr_windows if eng == "windows" else _ocr_tesseract
-            words = fn(clean)
-        except Exception as e:
-            errors.append(f"{eng}: {e}")
-            continue
-        for wd in words:  # back to original-image coordinates
-            wd.x = (wd.x - PAD) / SCALE; wd.y = (wd.y - PAD) / SCALE
-            wd.w /= SCALE; wd.h /= SCALE
-        if words:
-            return words, eng
-        errors.append(f"{eng}: no text found")
-        best = best or ([], eng)
-    if best:
-        return best
-    raise RuntimeError("No OCR engine worked:\n" + "\n".join(errors))
+        fn = _ocr_windows if eng == "windows" else _ocr_tesseract
+        best, best_score = None, -1
+        for mode in ("frequent", "solid", "main"):
+            try:
+                words = fn(preprocess(img, mode=mode))
+            except Exception as e:
+                errors.append(f"{eng}/{mode}: {e}")
+                break  # engine itself is broken -> next engine
+            sc = _score(words) if eng == "tesseract" else len("".join(w.text for w in words))
+            if sc > best_score:
+                best, best_score = words, sc
+        if best:
+            for wd in best:  # back to original-image coordinates
+                wd.x = (wd.x - PAD) / SCALE; wd.y = (wd.y - PAD) / SCALE
+                wd.w /= SCALE; wd.h /= SCALE
+            return best, eng
+        if best is not None:
+            errors.append(f"{eng}: no text found")
+    raise RuntimeError("No text found / OCR failed:\n" + "\n".join(errors))
 
 
 # --------------------------------------------------------------------------
@@ -283,6 +307,9 @@ def _fix(text):
     t = re.sub(r"(?<=[A-Z])[|](?=[-,\s]|$)", "1", t)
     t = re.sub(r"\b([A-Z]{1,3}) (\d+-)", r"\1\2", t)   # "DP 1-3" -> "DP1-3"
     t = re.sub(r"\b(SH|DP|M)[Il](?=[-,\s]|$)", r"\g<1>1", t)  # "SHI" -> "SH1"
+    t = re.sub(r"Bea(?:rn|r)(?=[\dlIs]|\b)", "Beam", t)             # "Bearn" -> "Beam"
+    t = re.sub(r"Beam[lI|](?=[-,\s\d]|$)", "Beam1", t)              # "Beaml" -> "Beam1"
+    t = re.sub(r"Beam[sSéB](?=[,\s]|$)", "Beam8", t)                # "Beams" -> "Beam8"
     return t.strip(" _|.'`\"")
 
 
