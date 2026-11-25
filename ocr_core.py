@@ -370,7 +370,21 @@ def _fix(text):
     return t.strip(" _|.'`\"")
 
 
-def image_to_table(img, engine="auto", split_cells=True):
+_CODE_CELL = re.compile(r"^\s*[0OQCD][1Il|]\s?[-—–~.]\s?((?:[0-9OoIlSBGDQC]\s?){5}[0-9OoIlSBGDQC])\s?(?:[-—–~_.=\s]*)$")
+_DIG = str.maketrans({"O": "0", "o": "0", "Q": "0", "D": "0", "C": "0", "G": "0",
+                      "I": "1", "l": "1", "S": "5", "B": "8"})
+
+
+def code_to_number(cell):
+    """'01-002278-___' -> '2278'. Other text is returned unchanged."""
+    m = _CODE_CELL.match(cell)
+    if not m:
+        return cell
+    digits = m.group(1).replace(" ", "").translate(_DIG)
+    return str(int(digits)) if digits.isdigit() else cell
+
+
+def image_to_table(img, engine="auto", split_cells=True, code_numbers=False):
     """Returns (rows, engine_used). rows = list of rows, each a list of cell strings.
     Cells are split where there is a wide horizontal gap (a new column)."""
     words, used = run_ocr(img, engine)
@@ -387,6 +401,8 @@ def image_to_table(img, engine="auto", split_cells=True):
                 cur.append(w.text)
         cells.append(" ".join(cur))
         cells = [_fix(c) for c in cells]
+        if code_numbers:
+            cells = [code_to_number(c) for c in cells]
         cells = [c for c in cells if re.search(r"[A-Za-z0-9].*[A-Za-z0-9]|[A-Za-z0-9]{1}", c)]
         # drop lines that are only noise (e.g. bits of grid lines)
         if cells and sum(len(re.sub(r"[^A-Za-z0-9]", "", c)) for c in cells) >= 2:

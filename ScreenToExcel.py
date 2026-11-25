@@ -29,7 +29,7 @@ class App:
         self.q = queue.Queue()
         self.busy = False
         root.title("Screen → Excel (OCR)")
-        root.geometry("760x620")
+        root.geometry("900x620")
         root.minsize(500, 400)
 
         bar = ttk.Frame(root, padding=6)
@@ -44,8 +44,10 @@ class App:
         self.autocopy = tk.BooleanVar(value=True)
         self.split = tk.BooleanVar(value=True)
         self.engine = tk.StringVar(value="auto")
+        self.codenum = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt, text="Copy automatically", variable=self.autocopy).pack(side="left")
         ttk.Checkbutton(opt, text="Split columns into Excel cells", variable=self.split).pack(side="left", padx=10)
+        ttk.Checkbutton(opt, text="Codes → number only (01-002278 → 2278)", variable=self.codenum).pack(side="left", padx=(0, 10))
         ttk.Label(opt, text="OCR:").pack(side="left")
         ttk.Combobox(opt, textvariable=self.engine, values=["auto", "tesseract", "windows"],
                      width=9, state="readonly").pack(side="left", padx=4)
@@ -115,11 +117,11 @@ class App:
         self.preview.configure(image=self._pv)
         self.status.set("Reading text…")
         self.root.config(cursor="watch")
-        engine, split = self.engine.get(), self.split.get()
+        engine, split, codenum = self.engine.get(), self.split.get(), self.codenum.get()
 
         def work():
             try:
-                self.q.put(("ok", ocr_core.image_to_table(img, engine, split)))
+                self.q.put(("ok", ocr_core.image_to_table(img, engine, split, codenum)))
             except Exception as e:
                 import traceback
                 self.q.put(("err", f"{e}\n\n{traceback.format_exc()}"))
