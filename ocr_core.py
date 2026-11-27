@@ -30,14 +30,19 @@ def trim_edge_strips(img: Image.Image) -> Image.Image:
     main = np.bincount(col_mode).argmax()
     w = len(col_mode)
     limit = max(4, int(w * 0.08))
+    rgb = np.asarray(img.convert("RGB")).astype(np.int32)
+    main_rgb = rgb[key == main].mean(axis=0)
+    near = np.sqrt(((rgb - main_rgb) ** 2).sum(axis=2)) < 90
+    main_frac = near.mean(axis=0)  # share of main background colour in each column
+
     left = 0
-    while left < w and col_mode[left] != main:
+    while left < min(limit, w) and main_frac[left] < 0.3:
         left += 1
     right = w
-    while right > 0 and col_mode[right - 1] != main:
+    while w - right < limit and right > 0 and main_frac[right - 1] < 0.3:
         right -= 1
-    left = left if left <= limit else 0
-    right = right if w - right <= limit else w
+    left = left if left < limit else 0
+    right = right if w - right < limit else w
     if right - left > w * 0.5 and (left or right < w):
         return img.crop((left, 0, right, img.height))
     return img
@@ -77,20 +82,34 @@ def _ink_rows(a):
     h, w, _ = a.shape
     q = a // 32
     keys = q[:, :, 0] * 64 + q[:, :, 1] * 8 + q[:, :, 2]
-    row_mode = np.array([np.bincount(keys[y]).argmax() for y in range(h)])
-    ink = np.zeros((h, w))
-    y = 0
+    coarse = (a // 64)
+    ckeys = coarse[:, :, 0] * 16 + coarse[:, :, 1] * 4 + coarse[:, :, 2]
+    row_mode = np.array([np.bincount(ckeys[y]).argmax() for y in range(h)])
+    bands, y = [], 0
     while y < h:
         y2 = y
         while y2 < h and row_mode[y2] == row_mode[y]:
             y2 += 1
+        bands.append([y, y2])
+        y = y2
+    thick = [y2 - y >= 4 for y, y2 in bands]
+    bgs = [_solid_bgs(a[y:y2], keys[y:y2]) if thick[i] else None for i, (y, y2) in enumerate(bands)]
+    ink = np.zeros((h, w))
+    for i, (y, y2) in enumerate(bands):
+        if thick[i]:
+            mine = list(bgs[i])
+        else:  # thin slice (blurry edge, or a line through the text): use neighbours
+            mine = []
+            for j in (i - 1, i + 1, i - 2, i + 2):
+                if 0 <= j < len(bands) and thick[j]:
+                    mine += bgs[j]
+            if not mine:
+                mine = _solid_bgs(a[y:y2], keys[y:y2])
         band = a[y:y2]
-        bgs = _solid_bgs(band, keys[y:y2])
         flat = band.reshape(-1, 1, 3)
-        bg = np.array(bgs).reshape(1, -1, 3)
+        bg = np.array(mine).reshape(1, -1, 3)
         d = np.sqrt(((flat - bg) ** 2).sum(axis=2)).min(axis=1)
         ink[y:y2] = d.reshape(y2 - y, w)
-        y = y2
     return ink
 
 
@@ -265,7 +284,7 @@ def find_tesseract():
     return shutil.which("tesseract")
 
 
-def _ocr_tesseract(img: Image.Image):
+def _ocr_tesseract(img: Image.Image, extra=()):
     import os, subprocess, sys, tempfile
     exe = find_tesseract()
     if not exe:
@@ -279,7 +298,7 @@ def _ocr_tesseract(img: Image.Image):
     try:
         img.save(path)
         flags = 0x08000000 if sys.platform == "win32" else 0  # CREATE_NO_WINDOW
-        r = subprocess.run([exe, path, "stdout", "-l", "eng", "--psm", "6", "tsv"],
+        r = subprocess.run([exe, path, "stdout", "-l", "eng", "--psm", "6", *extra, "tsv"],
                            capture_output=True, stdin=subprocess.DEVNULL,
                            env=env, creationflags=flags, timeout=60)
     finally:
@@ -300,7 +319,8 @@ def _ocr_tesseract(img: Image.Image):
 
 def _score(words):
     """How much confident text was found (longer + more confident = better)."""
-    return sum(len(re.sub(r"[^A-Za-z0-9]", "", w.text)) * max(w.conf, 0) / 100 for w in words)
+    return sum(len(re.sub(r"[^A-Za-z0-9]", "", w.text)) * (w.conf - 60) / 40
+               for w in words if w.conf >= 0)
 
 
 def run_ocr(img: Image.Image, engine: str = "auto"):
@@ -311,7 +331,7 @@ def run_ocr(img: Image.Image, engine: str = "auto"):
     errors = []
     for eng in order:
         fn = _ocr_windows if eng == "windows" else _ocr_tesseract
-        best, best_score = None, -1
+        best, best_score = None, float("-inf")
         for mode in ("rows", "frequent", "solid", "main"):
             try:
                 words = fn(preprocess(img, mode=mode))
@@ -363,10 +383,22 @@ def _fix(text):
     t = re.sub(r"(?<=[A-Za-z0-9])!", "1", t)      # "Beam!-3" -> "Beam1-3"
     t = re.sub(r"(?<=[A-Z])[|](?=[-,\s]|$)", "1", t)
     t = re.sub(r"\b([A-Z]{1,3}) (\d+-)", r"\1\2", t)   # "DP 1-3" -> "DP1-3"
-    t = re.sub(r"\b(SH|DP|M)[Il](?=[-,\s]|$)", r"\g<1>1", t)  # "SHI" -> "SH1"
+    t = re.sub(r"(?<=\w) +-|-(?= +\w)", "-", t)          # "M1 -2" -> "M1-2"
+    t = re.sub(r"-\s+", "-", t)
+    t = re.sub(r"^(\d) ([A-Z]-?)", r"\1\2", t)           # "1 F-Showroom" -> "1F-Showroom"
+    t = re.sub(r"\b(SH|DP|M)[Ilt|](?=[-,\s]|$)", r"\g<1>1", t)  # "SHI"/"DPt" -> "SH1"/"DP1"
+    t = re.sub(r"(?<![\w-])[QOa3]F-", "GF-", t)                   # "QF-Ent" -> "GF-Ent"
+    t = re.sub(r"(?<![\w-])AF-", "4F-", t)                        # "AF-Ent" -> "4F-Ent"
+    t = re.sub(r"GF[LlI]F", "GF1F", t)                             # "GFLF" -> "GF1F"
+    t = re.sub(r"Beam (\d)", r"Beam\1", t)                         # "Beam 7-10" -> "Beam7-10"
+    t = re.sub(r"\(([^()]*)\}", r"(\1)", t)                        # "WH(A}" -> "WH(A)"
+    t = re.sub(r"(?<=\d) (?=[A-Z]{1,3}\d)", ",", t)                # "XC4-7 DP3-4" -> "XC4-7,DP3-4"
     t = re.sub(r"Bea(?:rn|r)(?=[\dlIs]|\b)", "Beam", t)             # "Bearn" -> "Beam"
-    t = re.sub(r"Beam[lI|](?=[-,\s\d]|$)", "Beam1", t)              # "Beaml" -> "Beam1"
-    t = re.sub(r"Beam[sSéB](?=[,\s]|$)", "Beam8", t)                # "Beams" -> "Beam8"
+    t = re.sub(r"Beam[lI|t](?=[-,\s\d]|$)", "Beam1", t)
+    t = t.translate(str.maketrans("éèêÉ", "eeeE"))
+    t = re.sub(r"\bWal\b", "Wall", t)
+    t = re.sub(r"\b(\w+)-(error|down)\b", r"\1 \2", t)          # "check-error" -> "check error"              # "Beaml" -> "Beam1"
+    t = re.sub(r"Beam[sSéeB](?=[,\s]|$)", "Beam8", t)                # "Beams" -> "Beam8"
     return t.strip(" _|.'`\"")
 
 
@@ -384,17 +416,23 @@ def code_to_number(cell):
     return str(int(digits)) if digits.isdigit() else cell
 
 
-def image_to_table(img, engine="auto", split_cells=True, code_numbers=False):
-    """Returns (rows, engine_used). rows = list of rows, each a list of cell strings.
-    Cells are split where there is a wide horizontal gap (a new column)."""
-    words, used = run_ocr(img, engine)
+def _words_variant(img, eng, mode, scale, extra=()):
+    clean = preprocess(img, scale=scale, mode=mode)
+    words = _ocr_tesseract(clean, extra) if eng == "tesseract" else _ocr_windows(clean)
+    for wd in words:  # back to original-image coordinates
+        wd.x = (wd.x - PAD) / scale; wd.y = (wd.y - PAD) / scale
+        wd.w /= scale; wd.h /= scale
+    return words
+
+
+def _rows_from_words(words, split_cells, code_numbers):
+    """-> list of (y_center, tuple_of_cells)"""
     rows, med_h = group_rows(words)
     out = []
     for ws in rows:
         cells, cur = [], [ws[0].text]
         for prev, w in zip(ws, ws[1:]):
-            gap = w.x - prev.right
-            if split_cells and gap > med_h * 1.6:
+            if split_cells and w.x - prev.right > med_h * 1.6:
                 cells.append(" ".join(cur))
                 cur = [w.text]
             else:
@@ -403,8 +441,84 @@ def image_to_table(img, engine="auto", split_cells=True, code_numbers=False):
         cells = [_fix(c) for c in cells]
         if code_numbers:
             cells = [code_to_number(c) for c in cells]
-        cells = [c for c in cells if re.search(r"[A-Za-z0-9].*[A-Za-z0-9]|[A-Za-z0-9]{1}", c)]
-        # drop lines that are only noise (e.g. bits of grid lines)
+        cells = [c for c in cells if re.search(r"[A-Za-z0-9]", c)]
         if cells and sum(len(re.sub(r"[^A-Za-z0-9]", "", c)) for c in cells) >= 2:
-            out.append(cells)
-    return out, used
+            out.append((statistics.mean(w.cy for w in ws), tuple(cells)))
+    return out, med_h
+
+
+EQUAL = False
+VARIANTS = [("rows", 3, ()), ("frequent", 3, ()), ("solid", 3, ())]
+DIGITS = ("-c", "tessedit_char_whitelist=0123456789-_")
+
+
+def image_to_table(img, engine="auto", split_cells=True, code_numbers=False):
+    """Read the picture several ways and take a majority vote for every row.
+    Returns (rows, engine_used); rows = list of lists of cell strings."""
+    img = img.convert("RGB")
+    errors = []
+    use_tess = engine in ("auto", "tesseract")
+    if use_tess:
+        try:
+            results = []
+            for mode, sc, extra in VARIANTS:
+                words = _words_variant(img, "tesseract", mode, sc, extra)
+                rows, med_h = _rows_from_words(words, split_cells, code_numbers)
+                results.append((_score(words), rows, med_h))
+            # picture of codes? -> add digit-only readings as extra voters
+            best = max(results, key=lambda r: r[0])
+            if code_numbers and best[1] and sum(c[0].isdigit() for _, c in best[1]) >= len(best[1]) * 0.6:
+                for mode, sc in (("rows", 3), ("rows", 4), ("solid", 4)):
+                    words = _words_variant(img, "tesseract", mode, sc, DIGITS)
+                    rows, med_h = _rows_from_words(words, split_cells, code_numbers)
+                    results.append((_score(words), rows, med_h))
+            return _vote(results, code_numbers), "tesseract"
+        except Exception as e:
+            if engine == "tesseract":
+                raise
+            errors.append(f"tesseract: {e}")
+    words = _words_variant(img, "windows", "rows", SCALE)
+    rows, _ = _rows_from_words(words, split_cells, code_numbers)
+    note = "windows" + ("  |  " + errors[0].replace("\n", " ")[:160] if errors else "")
+    return [list(c) for _, c in rows], note
+
+
+def _vote(results, code_numbers):
+    """results: list of (score, rows, med_h). Rows from all readings are matched by
+    their height in the picture; a row is kept if enough readings saw it, and its
+    text is the weighted majority (more confident readings weigh more)."""
+    from collections import Counter
+    results = [r for r in results if r[1]]
+    if not results:
+        return []
+    scores = [r[0] for r in results]
+    lo, hi = min(scores), max(scores)
+    weights = [1.0 for sc in scores] if EQUAL else [0.3 + (sc - lo) / (hi - lo) if hi > lo else 1.0 for sc in scores]
+    med_h = statistics.median(r[2] for r in results)
+    # collect every row from every reading, then cluster by y
+    items = sorted((y, cells, wi) for wi, r in enumerate(results) for y, cells in r[1])
+    clusters, cur = [], [items[0]]
+    for it in items[1:]:
+        if it[0] - statistics.mean(x[0] for x in cur) <= med_h * 0.5:
+            cur.append(it)
+        else:
+            clusters.append(cur)
+            cur = [it]
+    clusters.append(cur)
+    total_w = sum(weights)
+    out = []
+    for cl in clusters:
+        seen = {}
+        for y, cells, wi in cl:  # one vote per reading per row
+            seen.setdefault(wi, cells)
+        support = sum(weights[wi] for wi in seen)
+        if support < total_w * 0.35:
+            continue  # only a few weak readings saw this "row": noise
+        votes = Counter()
+        for wi, cells in seen.items():
+            w = weights[wi]
+            if code_numbers and all(x.isdigit() for x in cells):
+                w += 0.5
+            votes[cells] += w
+        out.append(list(votes.most_common(1)[0][0]))
+    return out
